@@ -26,7 +26,10 @@ func TestParseRealSU3(t *testing.T) {
 	if s.Signer == "" {
 		t.Fatal("empty signer")
 	}
-	keys := TrustedKeys(t)
+	keys, err := TrustedKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Verify(keys); err != nil {
 		t.Fatal(err)
 	}
