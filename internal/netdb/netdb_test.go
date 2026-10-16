@@ -51,7 +51,7 @@ func testFloodfill(t *testing.T, seed byte) *data.RouterInfo {
 			EncType:    data.EncECIES_X25519,
 		},
 		Published: time.Now(),
-		Options:  map[string]string{"caps": "fR"},
+		Options:   map[string]string{"caps": "fR"},
 	}
 	if err := ri.Sign(skey); err != nil {
 		t.Fatal(err)
@@ -198,11 +198,11 @@ func TestStoreLS2(t *testing.T) {
 		End:      time.Now().Add(10 * time.Minute),
 	}
 	ls := &data.LeaseSet2{
-		Destination:     *dest,
-		Published:       time.Now(),
-		Expires:         time.Now().Add(10 * time.Minute),
-		EncryptionKeys:  []data.PublicKey{{EncType: data.EncECIES_X25519, Key: dest.EncKey}},
-		Leases:          []data.Lease{lease},
+		Destination:    *dest,
+		Published:      time.Now(),
+		Expires:        time.Now().Add(10 * time.Minute),
+		EncryptionKeys: []data.PublicKey{{EncType: data.EncECIES_X25519, Key: dest.EncKey}},
+		Leases:         []data.Lease{lease},
 	}
 	if err := ls.Sign(priv); err != nil {
 		t.Fatal(err)
