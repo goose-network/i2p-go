@@ -25,6 +25,9 @@ func ReadHash(b []byte) (Hash, []byte, error) {
 // ToI2PBase64 returns the standard I2P base64 of the hash (netdb filenames).
 func (h Hash) ToI2PBase64() string { return EncodeToI2PBase64(h[:]) }
 
+// Equal reports whether two hashes match.
+func (h Hash) Equal(o Hash) bool { return h == o }
+
 // RouterIdentity is a router's cryptographic identity: encryption key,
 // signing key, and certificate. Reference: KeysAndCert.java /
 // RouterIdentity.java.
