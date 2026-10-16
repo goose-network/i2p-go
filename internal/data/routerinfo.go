@@ -301,7 +301,7 @@ func (ri *RouterInfo) Verify() error {
 		if len(ri.Identity.SigningKey) != ed25519.PublicKeySize {
 			return fmt.Errorf("routerinfo: bad ed25519 key length %d", len(ri.Identity.SigningKey))
 		}
-		if !ed25519.Verify(ed25519.PublicKey(ri.Identity.SigningKey), ri.raw, ri.Signature) {
+		if !ed25519.Verify(ed25519.PublicKey(ri.Identity.SigningKey), ri.signedBytes(), ri.Signature) {
 			return fmt.Errorf("routerinfo: signature verification failed")
 		}
 		return nil
@@ -310,8 +310,24 @@ func (ri *RouterInfo) Verify() error {
 	}
 }
 
-// Bytes returns the full signed encoding (data + signature).
-func (ri *RouterInfo) Bytes() []byte {
+// Sign signs the router info in place with an Ed25519 private key
+// matching the identity's signing key. Reference: RouterInfo.sign
+// (signs everything before the signature).
+func (ri *RouterInfo) Sign(priv ed25519.PrivateKey) error {
+	if ri.Identity.SigType != SigEdDSA_SHA512_Ed25519 {
+		return fmt.Errorf("routerinfo: unsupported sig type %d for signing", ri.Identity.SigType)
+	}
+	ri.Signature = nil
+	ri.raw = nil
+	ri.Signature = ed25519.Sign(priv, ri.signedBytes())
+	return nil
+}
+
+// signedBytes serializes the router info without the signature.
+func (ri *RouterInfo) signedBytes() []byte {
+	if ri.raw != nil {
+		return ri.raw
+	}
 	var buf []byte
 	buf = ri.Identity.WriteTo(buf)
 	buf = append(buf, AppendLong(8, uint64(ri.Published.UnixMilli()))...)
@@ -321,8 +337,12 @@ func (ri *RouterInfo) Bytes() []byte {
 	}
 	buf = append(buf, 0) // peer count
 	buf = AppendProperties(buf, ri.Options)
-	buf = append(buf, ri.Signature...)
 	return buf
+}
+
+// Bytes returns the full signed encoding (data + signature).
+func (ri *RouterInfo) Bytes() []byte {
+	return append(ri.signedBytes(), ri.Signature...)
 }
 
 // RouterHash returns SHA-256 over the identity encoding.
