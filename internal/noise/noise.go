@@ -97,12 +97,13 @@ func NewSymmetricState(protocolName string) *SymmetricState {
 	return s
 }
 
-// MixHash sets h = SHA256(h || data). Reference: SymmetricState.mixHash.
+// MixHash sets h = SHA256(h || data). Reference: SymmetricState.mixHash
+// / i2pd NoiseSymmetricState::MixHash.
 func (s *SymmetricState) MixHash(data []byte) {
 	d := sha256.New()
 	d.Write(s.h[:])
 	d.Write(data)
-	s.h = sha256.Sum256(d.Sum(nil))
+	s.h = [32]byte(d.Sum(nil))
 }
 
 // MixKey sets ck, k = HKDF2(salt=ck, IKM=data, info="") and keys the
@@ -192,6 +193,9 @@ type HandshakeState struct {
 	ephReady     bool
 	remoteStatic []byte // rs (Bob's s, known to Alice for XK)
 	remoteEphem  []byte // re
+	// started records whether Start's pre-message hashing ran, so a
+	// double Start is harmless (Java throws; we tolerate).
+	started bool
 }
 
 // NewHandshakeState creates a handshake for pattern (XK or IK), with
@@ -234,13 +238,30 @@ func NewHandshakeState(protocolName string, pattern Pattern, initiator bool, loc
 		// Bob reads the first message.
 		h.action = 1
 	}
+	h.Start()
 	return h, nil
 }
 
-// Start finalizes the handshake setup. Reference: HandshakeState.start.
-func (h *HandshakeState) Start() error {
-	// Nothing to validate: keys were generated at construction.
-	return nil
+// Start finalizes the handshake setup: the pre-message static key is
+// hashed into h (the "<- s" pre-message every pattern we implement
+// carries — XK, IK, and N). Without this the AEAD associated data
+// diverges from the reference routers' and every handshake fails
+// verification. Reference: HandshakeState.start() (LOCAL_PREMSG /
+// REMOTE_PREMSG) and i2pd InitNoiseState (h = SHA256(hh || pub)).
+func (h *HandshakeState) Start() {
+	if h.started {
+		return
+	}
+	h.started = true
+	// The pre-message key is the responder's static key: the initiator
+	// knows it as the remote static, the responder owns it locally.
+	if h.initiator {
+		if len(h.remoteStatic) == 32 {
+			h.symmetric.MixHash(h.remoteStatic)
+		}
+	} else if len(h.localStaticPub) == 32 {
+		h.symmetric.MixHash(h.localStaticPub)
+	}
 }
 
 // LocalStaticPublic returns the local static public key.
@@ -306,6 +327,7 @@ func (h *HandshakeState) Clone() (*HandshakeState, error) {
 		initiator: h.initiator,
 		action:    h.action,
 		ephReady:  h.ephReady,
+		started:   h.started,
 	}
 	if h.localStaticPriv != nil {
 		c.localStaticPriv = append([]byte(nil), h.localStaticPriv...)

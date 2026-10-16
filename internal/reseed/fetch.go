@@ -1,11 +1,13 @@
 // Reseed fetching: HTTPS download of the SU3 router-info bundle
-// through the upstream proxy, TLS-verified against the pinned reseed
-// certificates, then SU3 signature verification and extraction.
+// through the upstream proxy, TLS-verified against the system roots
+// plus the pinned reseed certificates, then SU3 signature verification
+// and extraction.
 //
-// The bundled certs are also the TLS trust roots; hostname
-// verification is replaced by chain verification against those roots
-// (reseed certs commonly carry no matching SANs), which is safe here
-// because the SU3 signature pins the content to a known signer key.
+// The pinned certs are also added as TLS trust roots (Java does the
+// same via SSLEepGet: system key store + certificates/ssl/), since
+// reseed hosts use a mix of public CAs and pinned self-signed certs.
+// The SU3 signature pins the downloaded content to a known signer key
+// regardless of the TLS layer.
 //
 // Reference: Reseeder.java, SSLProxyFetcher / EepGet fetch in the
 // Java router.
@@ -61,13 +63,19 @@ func TrustedKeys() (map[string]crypto.PublicKey, error) {
 	return keys, nil
 }
 
-// certPool builds a TLS root pool from the bundled reseed certs.
+// certPool builds the TLS root pool: the pinned reseed certs plus the
+// system roots. Java does the same (KeyStoreUtil.loadSystemKeyStore
+// then addCerts(certificates/ssl/)) — most reseed hosts use public CAs
+// (Let's Encrypt etc.), a few use the pinned self-signed certs.
 func certPool() (*x509.CertPool, error) {
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
 	entries, err := certFS.ReadDir("certs")
 	if err != nil {
 		return nil, fmt.Errorf("reseed: certs: %w", err)
 	}
-	pool := x509.NewCertPool()
 	for _, e := range entries {
 		b, err := certFS.ReadFile("certs/" + e.Name())
 		if err != nil {
@@ -97,28 +105,37 @@ func Fetch(ctx context.Context, seedURL string, upstream *proxy.Dialer) (*SU3, e
 	}
 	serverName := u.Hostname()
 
-	// Chain verification against the pinned roots (no hostname check:
-	// see the package comment). The SU3 signature pins the content.
+	// Standard chain + hostname verification of the leaf against the
+	// system roots plus the pinned reseed certs, using the server-sent
+	// intermediates (what Java's SSLEepGet does). The SU3 signature
+	// additionally pins the content to a known signer key.
 	verifyChain := func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
 			return fmt.Errorf("reseed: no server certificate")
 		}
-		for _, raw := range rawCerts {
-			cert, err := x509.ParseCertificate(raw)
-			if err != nil {
-				return fmt.Errorf("reseed: bad cert: %w", err)
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("reseed: bad cert: %w", err)
+		}
+		intermediates := x509.NewCertPool()
+		for _, raw := range rawCerts[1:] {
+			if c, err := x509.ParseCertificate(raw); err == nil {
+				intermediates.AddCert(c)
 			}
-			if _, err := cert.Verify(x509.VerifyOptions{Roots: pool}); err != nil {
-				return fmt.Errorf("reseed: cert not from a pinned root: %w", err)
-			}
+		}
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Roots:         pool,
+			Intermediates: intermediates,
+			DNSName:       serverName,
+		}); err != nil {
+			return fmt.Errorf("reseed: cert not trusted: %w", err)
 		}
 		return nil
 	}
 	tlsCfg := &tls.Config{
 		ServerName:            serverName,
-		InsecureSkipVerify:    true, // replaced by VerifyPeerCertificate below
-		VerifyPeerCertificate: verifyChain,
 		MinVersion:            tls.VersionTLS12,
+		VerifyPeerCertificate: verifyChain,
 	}
 
 	tr := &http.Transport{

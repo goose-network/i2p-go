@@ -17,6 +17,7 @@ import (
 	"math/bits"
 
 	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/poly1305"
 )
 
 // ErrBadTag is returned when AEAD authentication fails.
@@ -149,90 +150,13 @@ func (a *AEAD) macInput(ad, ct []byte) []byte {
 }
 
 // poly1305Sum computes the RFC 8439 Poly1305 tag of msg under key.
-//
-// 3x64-bit limb implementation (the structure poly1305-donna-64 and the
-// Go standard library use): the accumulator h is held as three
-// saturated little-endian limbs h[0] + h[1]<<64 + h[2]<<128, multiplied
-// by the clamped 2-limb r and partially reduced with the identity
-// 2^130 ≡ 5 (mod 2^130-5).
+// Uses x/crypto's poly1305 (same dependency tree as chacha20) rather
+// than a hand-rolled limb implementation: a carry double-count in the
+// latter made long-message tags fail verification with probability
+// ~3% per 16-byte block, which surfaced as intermittent NTCP2 handshake
+// failures on the (long) SessionConfirmed payload.
 func poly1305Sum(tag *[16]byte, msg []byte, key *[32]byte) {
-	// Clamp r and load s.
-	r0 := binary.LittleEndian.Uint64(key[0:8]) & 0x0FFFFFFC0FFFFFFF
-	r1 := binary.LittleEndian.Uint64(key[8:16]) & 0x0FFFFFFC0FFFFFFC
-	s0 := binary.LittleEndian.Uint64(key[16:24])
-	s1 := binary.LittleEndian.Uint64(key[24:32])
-
-	var h0, h1, h2 uint64
-	for len(msg) > 0 {
-		// h += m, with the length bit set just past the message chunk.
-		var m0, m1 uint64
-		if len(msg) >= 16 {
-			m0 = binary.LittleEndian.Uint64(msg[0:8])
-			m1 = binary.LittleEndian.Uint64(msg[8:16])
-			msg = msg[16:]
-			h2++ // bit 128
-		} else {
-			var buf [16]byte
-			copy(buf[:], msg)
-			buf[len(msg)] = 1
-			m0 = binary.LittleEndian.Uint64(buf[0:8])
-			m1 = binary.LittleEndian.Uint64(buf[8:16])
-			msg = nil
-		}
-		var c uint64
-		h0, c = bits.Add64(h0, m0, 0)
-		h1, c = bits.Add64(h1, m1, c)
-		h2 += c
-
-		// h *= r: five 128-bit products (h2's products fit in 64 bits).
-		h0r0hi, h0r0lo := bits.Mul64(h0, r0)
-		h1r0hi, h1r0lo := bits.Mul64(h1, r0)
-		h2r0 := h2 * r0
-		h0r1hi, h0r1lo := bits.Mul64(h0, r1)
-		h1r1hi, h1r1lo := bits.Mul64(h1, r1)
-		h2r1 := h2 * r1
-
-		// Sum the overlapping columns into limbs t0..t3.
-		t0 := h0r0lo
-		t1, c := bits.Add64(h1r0lo, h0r1lo, 0)
-		t2, c := bits.Add64(h2r0, h1r1lo, c)
-		t3, _ := bits.Add64(h2r1, 0, c)
-		t1, c = bits.Add64(t1, h0r0hi, 0)
-		t2, c = bits.Add64(t2, h1r0hi, c)
-		t3, _ = bits.Add64(t3, h1r1hi, c)
-		t2, c = bits.Add64(t2, h0r1hi, c)
-		t3, _ = bits.Add64(t3, 0, c)
-
-		// Partial reduction mod 2^130-5: fold everything above bit 130
-		// back in. cc = the portion of t2:t3 above the low 2 bits of t2,
-		// shifted left by 2 relative to the fold identity, so adding cc
-		// contributes 4c and cc>>2 contributes c.
-		cc0, cc1 := t2&^3, t3
-		h0, h1, h2 = t0, t1, t2&3
-		h0, c = bits.Add64(h0, cc0, 0)
-		h1, c = bits.Add64(h1, cc1, c)
-		h2 += c
-		cc0 = cc0>>2 | (cc1&3)<<62
-		cc1 >>= 2
-		h0, c = bits.Add64(h0, cc0, 0)
-		h1, c = bits.Add64(h1, cc1, c)
-		h2 += c
-	}
-
-	// Fully reduce: t = h - (2^130 - 5); keep t unless it underflowed.
-	const p0 = 0xFFFFFFFFFFFFFFFB
-	t0, b := bits.Sub64(h0, p0, 0)
-	t1, b := bits.Sub64(h1, ^uint64(0), b)
-	_, b = bits.Sub64(h2, 3, b)
-	if b == 0 {
-		h0, h1 = t0, t1
-	}
-
-	// tag = h + s mod 2^128.
-	h0, c := bits.Add64(h0, s0, 0)
-	h1, _ = bits.Add64(h1, s1, c)
-	binary.LittleEndian.PutUint64(tag[0:8], h0)
-	binary.LittleEndian.PutUint64(tag[8:16], h1)
+	poly1305.Sum(tag, msg, key)
 }
 
 // HKDF is the single-output I2P HKDF: PRK = HMAC-SHA256(salt=key,

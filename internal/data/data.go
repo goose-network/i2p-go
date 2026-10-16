@@ -124,6 +124,14 @@ func encodeB64(b []byte, alphabet string) string {
 	if nbits > 0 {
 		out = append(out, alphabet[(acc<<(6-nbits))&0x3f])
 	}
+	// Pad to a multiple of 4 chars. The reference encoders (Java
+	// Base64.encode, i2pd ByteStreamToBase64) always emit '=' padding,
+	// and i2pd's decoder rejects unpadded input outright (Base.cpp
+	// Base64ToByteStream: length % 4 != 0 → 0 bytes decoded), which
+	// made our RouterInfo's "s"/"i" options parse as invalid.
+	for len(out)%4 != 0 {
+		out = append(out, '=')
+	}
 	return string(out)
 }
 

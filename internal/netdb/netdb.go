@@ -13,6 +13,7 @@
 package netdb
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -62,6 +63,18 @@ func (n *NetDB) GetRI(h data.Hash) *data.RouterInfo {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.ri[h]
+}
+
+// AllRouters returns every stored router info, freshest first.
+func (n *NetDB) AllRouters() []*data.RouterInfo {
+	n.mu.RLock()
+	list := make([]*data.RouterInfo, 0, len(n.ri))
+	for _, ri := range n.ri {
+		list = append(list, ri)
+	}
+	n.mu.RUnlock()
+	sort.Slice(list, func(i, j int) bool { return list[i].Published.After(list[j].Published) })
+	return list
 }
 
 // StoreLS2 stores a LeaseSet2.

@@ -199,6 +199,74 @@ func TestAEADRFCVector(t *testing.T) {
 	}
 }
 
+// TestAEADLongMessageVector is a captured end-to-end vector: the exact
+// key, associated data, and 671-byte payload of a real NTCP2
+// SessionConfirmed part 2 whose tag a hand-rolled Poly1305
+// mis-computed (a carry double-count in the limb sum, ~3% per block).
+// The expected ciphertext and tag were verified against the
+// cryptography library's ChaCha20Poly1305. This is the only test that
+// exercises the MAC over a many-block, partial-final-block message.
+func TestAEADLongMessageVector(t *testing.T) {
+	key, _ := hex.DecodeString("e0f10fe2090eb3134b9a21ba12cb714d4520ce3488982d5e252303b5d7353b6a")
+	ad, _ := hex.DecodeString("0c9d418916326cfc24bb0e053f49bd7b13866c3001c923fd897d6b3e74e5bafb")
+	// A real message-3 payload: RouterInfo block (type 2) carrying the
+	// 638-byte RouterInfo, options block (type 1), padding block (254).
+	ri, _ := hex.DecodeString(
+		"51406846b157378010784932197482bf86a0b69e66d89f749b10e681a885671a" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"0000000000000000000000000000000000000000000000000000000000000000" +
+			"9695a559f5de26543e6573eea35800fcf86e88dcd163c283cdc0bad510e4210b" +
+			"05000400070004000001a143d4225301050000000000000000054e5443503200" +
+			"6e04686f73743d0934352e31302e302e313b01693d1872495457664a524f417e" +
+			"724b71454450313541637e513d3d3b04706f72743d01303b01733d2c5555426f" +
+			"527246584e34415165456b7947585343763461677470356d324a39306d78446d" +
+			"676169465a786f3d3b01763d01323b00002c04636170733d024c553b056e6574" +
+			"49643d01323b0e726f757465722e76657273696f6e3d06322e31332e303be5fc" +
+			"49706c80c26793b76289c5c9d28b21aaca2de06cee688d891d172a7b65e6e50c" +
+			"5190ee72a7a8db3803bb3977ee9f3be2ee54134387fb754cdfadd9e3cc09")
+	payload := make([]byte, 0, 671)
+	payload = append(payload, 0x02, 0x02, 0x7f, 0x00) // block, len 639, flag 0
+	payload = append(payload, ri...)
+	payload = append(payload, 0x01, 0x00, 0x0c)       // options block, len 12
+	payload = append(payload, 0x00, 0x01, 0x00, 0x01) // padding min/max 0..1
+	payload = append(payload, make([]byte, 8)...)
+	payload = append(payload, 0xfe, 0x00, 0x0b) // padding block, len 11
+	payload = append(payload, make([]byte, 11)...)
+	if len(payload) != 671 {
+		t.Fatalf("payload length %d", len(payload))
+	}
+	wantCt, _ := hex.DecodeString(
+		"2374b5f652aacb33a0ff21ae2ced3fcda9ed588cb7a1b3d2c33238ef9daf1adc")
+	wantTag, _ := hex.DecodeString("39783cb0d57592a42ac9678b19ea8e31")
+
+	a := NewAEAD(key)
+	out := a.Seal(ad, payload)
+	if len(out) != 671+16 {
+		t.Fatalf("output length %d", len(out))
+	}
+	if !bytes.Equal(out[:32], wantCt) {
+		t.Fatalf("ciphertext head mismatch\n got %x\nwant %x", out[:32], wantCt)
+	}
+	if !bytes.Equal(out[len(out)-16:], wantTag) {
+		t.Fatalf("tag mismatch\n got %x\nwant %x", out[len(out)-16:], wantTag)
+	}
+	// The counter is shared by Seal and Open (one monotonic nonce per
+	// cipher state, as in the Java reference), so reset before opening.
+	a.SetNonce(0)
+	pt, err := a.Open(ad, out)
+	if err != nil || !bytes.Equal(pt, payload) {
+		t.Fatalf("round-trip failed: %v", err)
+	}
+}
+
 // TestHKDF checks the I2P HKDF flavor.
 func TestHKDF(t *testing.T) {
 	out1, out2 := HKDF2([]byte("salt"), []byte("ikm"), "")
