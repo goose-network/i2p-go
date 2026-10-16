@@ -3,9 +3,11 @@ package ntcp2
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goose-network/i2p-go/internal/i2pcrypto"
@@ -36,13 +38,27 @@ type Conn struct {
 	Terminated bool
 	// TermReason is the termination reason from the peer.
 	TermReason int
+	// LastError records why the read loop ended — "eof",
+	// "terminated: reason=N", or the error text. Diagnostic only.
+	LastError string
 
 	// Callback for I2NP messages from received frames.
 	// (Set by the router layer; dispatch is via OnI2NP.)
 	OnI2NP func(raw []byte)
 	// OnRI is called for RouterInfo blocks (netdb intake).
 	OnRI func(ri []byte, flood bool)
+
+	// dead is set once the read loop has ended (EOF, termination
+	// block, or error): the connection can no longer carry data.
+	dead atomic.Bool
+	// OnClose, if set, is invoked once when the read loop ends. The
+	// router uses it to evict the session from its cache so the next
+	// send re-dials.
+	OnClose func()
 }
+
+// Dead reports whether the connection's read loop has ended.
+func (c *Conn) Dead() bool { return c.dead.Load() }
 
 // writeBlocks frames and sends one or more blocks as a single frame.
 // Reference: NTCPConnection.sendNTCP2.
@@ -112,13 +128,26 @@ func newReader(conn net.Conn) *bufio.Reader {
 }
 
 // ReadLoop reads frames and dispatches blocks until the connection
-// ends. Runs in its own goroutine.
+// ends. Runs in its own goroutine. On exit it always closes the
+// socket (a peer FIN must not leave us in CLOSE-WAIT), marks the
+// connection dead, and invokes OnClose.
 func (c *Conn) ReadLoop() {
+	defer func() {
+		c.conn.Close()
+		c.dead.Store(true)
+		if c.OnClose != nil {
+			c.OnClose()
+		}
+	}()
 	for {
 		if err := c.ReadFrame(); err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, ErrTerminated) {
-				// Network or AEAD failure: close.
-				c.conn.Close()
+			switch {
+			case errors.Is(err, ErrTerminated):
+				c.LastError = fmt.Sprintf("terminated: reason=%d", c.TermReason)
+			case errors.Is(err, io.EOF):
+				c.LastError = "eof"
+			default:
+				c.LastError = err.Error()
 			}
 			return
 		}
@@ -127,7 +156,7 @@ func (c *Conn) ReadLoop() {
 
 // Ping sends a DateTime block (used as a keepalive).
 func (c *Conn) Ping() error {
-	return c.writeBlocks([]Block{DateTimeBlock(time.Now())})
+	return c.writeBlocks([]Block{DateTimeBlock(time.Now()), PaddingBlock(16)})
 }
 
 // Write implements io.Writer so Conn can back higher layers directly.

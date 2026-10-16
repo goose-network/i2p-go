@@ -44,6 +44,15 @@ type RouterIdentity struct {
 	SigType    SigType
 	EncType    EncType
 	Pad        []byte // legacy-field padding: 256-len(EncKey) + 128-len(SigningKey) - extra-key-data bytes
+
+	// certRaw is the identity's certificate exactly as parsed. The
+	// identity hash covers these bytes, so a parsed identity must
+	// re-emit them verbatim: a legacy ElGamal+DSA destination ends with
+	// a 3-byte NULL certificate, and synthesizing a key certificate
+	// instead changes the bytes (and the hash, and the b32 hostname).
+	// Identities constructed in-process leave certRaw nil and are
+	// encoded with a synthesized key certificate.
+	certRaw []byte
 }
 
 // ReadRouterIdentity parses a router identity.
@@ -61,7 +70,7 @@ func ReadRouterIdentity(b []byte) (RouterIdentity, []byte, error) {
 	if err != nil {
 		return RouterIdentity{}, nil, err
 	}
-	id := RouterIdentity{}
+	id := RouterIdentity{certRaw: append([]byte(nil), cert.Raw...)}
 	if cert.Type == CertTypeKey {
 		kc, err := cert.ParseKeyCertificate()
 		if err != nil {
@@ -142,8 +151,32 @@ func (id RouterIdentity) WriteTo(buf []byte) []byte {
 	}
 	buf = append(buf, encField...)
 	buf = append(buf, sigField...)
+	if id.certRaw != nil {
+		// A parsed identity re-emits its certificate bytes verbatim
+		// (see the certRaw field comment).
+		return append(buf, id.certRaw...)
+	}
 	kc := KeyCertificate{SigType: id.SigType, EncType: id.EncType, ExtraKeyData: extra}
 	return kc.WriteTo(buf)
+}
+
+// Clone returns a deep copy of the identity. Key material, padding, and
+// the raw certificate bytes are all copied, so the copy hashes and
+// re-encodes identically to the original — necessary because certRaw is
+// unexported, so a field-by-field copy outside this package would drop
+// it and change the hash.
+func (id RouterIdentity) Clone() RouterIdentity {
+	c := RouterIdentity{
+		EncKey:     append([]byte(nil), id.EncKey...),
+		SigningKey: append([]byte(nil), id.SigningKey...),
+		SigType:    id.SigType,
+		EncType:    id.EncType,
+		Pad:        append([]byte(nil), id.Pad...),
+	}
+	if id.certRaw != nil {
+		c.certRaw = append([]byte(nil), id.certRaw...)
+	}
+	return c
 }
 
 // RouterHash computes the router identity hash: SHA-256 over the

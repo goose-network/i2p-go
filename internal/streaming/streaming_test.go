@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -182,6 +183,78 @@ func TestPacketSignature(t *testing.T) {
 	p4.Sign(wrongPriv)
 	if p4.Verify(priv.Public().(ed25519.PublicKey)) {
 		t.Fatal("forged FROM must not verify")
+	}
+}
+
+// TestPacketOfflineSignature round-trips an offline-signed packet the
+// way zzz.i2p's streaming layer sends them: the destination's real key
+// authorizes a transient key (signature over expires+type+SPK) and the
+// transient key signs the packet itself.
+func TestPacketOfflineSignature(t *testing.T) {
+	dest, realPriv := testDest(t, 5)
+	transPub, transPriv, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := uint32(time.Now().Add(time.Hour).Unix())
+
+	// The offline signature by the real key over the transient block.
+	var block []byte
+	block = binary.BigEndian.AppendUint32(block, expires)
+	block = binary.BigEndian.AppendUint16(block, uint16(data.SigEdDSA_SHA512_Ed25519))
+	block = append(block, transPub...)
+	offlineSig := ed25519.Sign(realPriv, block)
+
+	p := &Packet{
+		SequenceNum:      1,
+		Flags:            FlagSYN | FlagFromIncluded | FlagSignatureIncluded | FlagMaxPacketSize | FlagSignatureOffline,
+		OptionalFrom:     dest,
+		OptionalMaxSize:  1730,
+		TransientExpires: expires,
+		TransientSigType: data.SigEdDSA_SHA512_Ed25519,
+		TransientSPK:     transPub,
+		OfflineSignature: offlineSig,
+		Payload:          []byte("syn-ack"),
+	}
+	p.OptionalSig = ed25519.Sign(transPriv, p.encode(ed25519.SignatureSize))
+
+	// Wire round trip: the parse must recover the transient block and
+	// the signature separately (they share the option area).
+	got, err := ParsePacket(p.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Verify(dest.SigningKey) {
+		t.Fatal("offline signature should verify with the FROM's real key")
+	}
+	// The caller's key is ignored when FROM is present.
+	if !got.Verify(nil) {
+		t.Fatal("Verify must use the FROM key")
+	}
+	if !bytes.Equal(got.TransientSPK, transPub) {
+		t.Fatal("transient SPK mismatch after round trip")
+	}
+
+	// Wrong transient key in the block: the offline signature fails.
+	got.TransientSPK[0] ^= 1
+	if got.Verify(dest.SigningKey) {
+		t.Fatal("tampered transient SPK must not verify")
+	}
+
+	// Expired transient key.
+	got2, err := ParsePacket(p.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2.TransientExpires = uint32(time.Now().Add(-time.Hour).Unix())
+	// Re-sign the offline block so only the expiry is wrong.
+	var b2 []byte
+	b2 = binary.BigEndian.AppendUint32(b2, got2.TransientExpires)
+	b2 = binary.BigEndian.AppendUint16(b2, uint16(data.SigEdDSA_SHA512_Ed25519))
+	b2 = append(b2, transPub...)
+	got2.OfflineSignature = ed25519.Sign(realPriv, b2)
+	if got2.Verify(dest.SigningKey) {
+		t.Fatal("expired transient key must not verify")
 	}
 }
 

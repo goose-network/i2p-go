@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -150,10 +151,15 @@ func (r *Router) PublishLeaseSet(ctx context.Context) error {
 	if err := ls.Sign(r.destPriv); err != nil {
 		return err
 	}
+	// Our own copy is stored regardless of whether the floodfill store
+	// below succeeds: the LS2-attach clove (ls2AttachClove) rides on
+	// outgoing packets and is how remotes learn our leases even when
+	// floodfill stores are failing (e.g. a proxied network where most
+	// store handshakes EOF).
+	r.db.StoreLS2(ls)
 	if err := r.store.StoreLS2(ctx, ls); err != nil {
 		return err
 	}
-	r.db.StoreLS2(ls) // our own copy for local reference
 	logf("leaseset published (%d lease, enc ECIES-X25519)", len(ls.Leases))
 	return nil
 }
@@ -188,29 +194,100 @@ func (r *Router) SendPacket(to *data.Destination, packet []byte, fromPort, toPor
 		Msg: i2np.New(i2np.TypeData, dm.Payload()),
 	}
 
-	// Garlic: ECIES-Ratchet to the remote ratchet public key.
-	ct := r.garlic.EncryptSession(lsRatchetKey(ls), []*garlic.Clove{clove})
+	// Garlic: ECIES-Ratchet to the remote ratchet public key. The
+	// first packet to a remote (and the first after our LeaseSet2 is
+	// republished on tunnel rotation) carries our LeaseSet2 along as
+	// a local-delivery DatabaseStore clove, so the remote can route
+	// replies without a netdb lookup of its own.
+	cloves := []*garlic.Clove{clove}
+	if ls2clove := r.ls2AttachClove(remoteHash); ls2clove != nil {
+		cloves = append([]*garlic.Clove{ls2clove}, cloves...)
+	}
+	ct := r.garlic.EncryptSession(lsRatchetKey(ls), cloves)
 	gmsg := i2np.New(i2np.TypeGarlic, (&i2np.GarlicMessage{Data: ct}).Payload())
 
 	// Route through the remote lease: TunnelGatewayMessage to the
-	// remote tunnel gateway, sent over NTCP2.
-	lease := pickLease(ls)
-	if lease == nil {
-		return errNoLease
+	// remote tunnel gateway, sent over NTCP2. Every unexpired lease
+	// is tried, freshest first: the remote's gateways rotate, and any
+	// one of them may refuse our transport (measured: some routers
+	// consistently close our NTCP2 handshake), while its other lease
+	// still routes.
+	for _, lease := range pickLeases(ls) {
+		wrapped := tunnel.SendDirect(gmsg, lease.TunnelID)
+		if err := r.SendI2NP(lease.Gateway, wrapped.Encode9()); err != nil {
+			logf("send to %s via gw %s tid=%d: %v", remoteHash.ToI2PBase64()[:8], lease.Gateway.ToI2PBase64()[:8], lease.TunnelID, err)
+			continue
+		}
+		return nil
 	}
-	wrapped := tunnel.SendDirect(gmsg, lease.TunnelID)
-	return r.SendI2NP(lease.Gateway, wrapped.Encode9())
+	// All leases failed: the cached LS2 leads nowhere we can reach —
+	// evict it so the streaming retransmit re-looks-up (a fresh LS2
+	// may carry different gateways; the remote rotates them on its
+	// own schedule).
+	r.db.EvictLS2(remoteHash)
+	return ErrNoRoute
 }
 
-// remoteLeaseSet looks up (and caches) the remote LeaseSet2.
+// ls2AttachClove returns our LeaseSet2 wrapped in a local-delivery
+// DatabaseStore clove when it is due for this remote: the first packet
+// to a remote, and the first after our LeaseSet2 is republished
+// (inbound tunnel rotation). This mirrors the reference routers, which
+// tag a ratchet session with a LeaseSet-update status and attach the
+// LeaseSet to the next garlic message until the remote confirms.
+// Reference: GarlicRoutingSession.m_LeaseSetUpdateStatus;
+// ECIESX25519AEADRatchetSession::CreateLeaseSetClove.
+func (r *Router) ls2AttachClove(remote data.Hash) *garlic.Clove {
+	ourHash := data.DestinationHash(*r.dest)
+	ls := r.db.GetLS2(ourHash)
+	if ls == nil {
+		return nil
+	}
+	r.lsMu.Lock()
+	sent, ok := r.lsSent[remote]
+	r.lsMu.Unlock()
+	if ok && !ls.Published.After(sent) {
+		return nil
+	}
+	r.lsMu.Lock()
+	r.lsSent[remote] = ls.Published
+	r.lsMu.Unlock()
+
+	store := &i2np.DatabaseStore{
+		Key:  ourHash,
+		Kind: i2np.DbLeaseSet2,
+		// ReplyToken 0: no confirmation is requested — the store is a
+		// courtesy hint, not a netdb publish.
+		Entry: ls.Bytes(),
+	}
+	return &garlic.Clove{
+		Instructions: garlic.DeliveryInstructions{Mode: garlic.ModeLocal},
+		Msg:          i2np.New(i2np.TypeDatabaseStore, store.Payload()),
+	}
+}
+
+// remoteLeaseSet looks up (and caches) the remote LeaseSet2. A cached
+// copy is only used while it still has an unexpired lease: the remote's
+// tunnels rotate on their own schedule, so "recently published" does
+// not imply "still routable". When it goes stale we evict it and
+// refetch — a fresh LS2 carries fresh leases.
 func (r *Router) remoteLeaseSet(to *data.Destination) (*data.LeaseSet2, error) {
 	hash := data.DestinationHash(*to)
-	if ls := r.db.GetLS2(hash); ls != nil && time.Since(ls.Published) < lsFreshness {
+	if ls := r.db.GetLS2(hash); ls != nil && time.Since(ls.Published) < lsFreshness && pickLease(ls) != nil {
 		return ls, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
-	defer cancel()
-	return r.lookup.LookupLS2(ctx, hash)
+	for attempt := 0; attempt < 2; attempt++ {
+		r.db.EvictLS2(hash)
+		ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+		ls, err := r.lookup.LookupLS2(ctx, hash)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		if pickLease(ls) != nil {
+			return ls, nil
+		}
+	}
+	return nil, errNoLease
 }
 
 // lsFreshness is how long we trust a remote LS2 before re-looking.
@@ -231,16 +308,23 @@ var errNoLease = errors.New("router: remote has no lease")
 
 // pickLease chooses the freshest non-expired lease.
 func pickLease(ls *data.LeaseSet2) *data.Lease {
+	leases := pickLeases(ls)
+	if len(leases) == 0 {
+		return nil
+	}
+	return leases[0]
+}
+
+// pickLeases returns the non-expired leases, freshest first.
+func pickLeases(ls *data.LeaseSet2) []*data.Lease {
 	now := time.Now()
-	var best *data.Lease
+	var out []*data.Lease
 	for i := range ls.Leases {
 		l := &ls.Leases[i]
-		if l.End.Before(now) {
-			continue
-		}
-		if best == nil || l.End.After(best.End) {
-			best = l
+		if l.End.After(now) {
+			out = append(out, l)
 		}
 	}
-	return best
+	sort.Slice(out, func(i, j int) bool { return out[i].End.After(out[j].End) })
+	return out
 }

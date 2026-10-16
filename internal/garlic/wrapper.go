@@ -203,9 +203,19 @@ func (m *Manager) buildNS(target []byte, cloves []*Clove) ([]byte, error) {
 	}
 	// Overwrite the ephemeral with its Elligator2 encoding.
 	copy(msg, encoded)
-	// Store the state for NSR matching.
+	// Store the state for NSR matching. A handshake still in flight
+	// keeps its earlier state: the retransmitted NS is a new handshake,
+	// but the NSR answering the earlier NS can still arrive (see
+	// addPendingNS). Once a session is established (or we are Bob),
+	// a fresh Alice session replaces it.
 	m.mu.Lock()
-	m.sessions[string(target)] = newAliceSession(target, state, time.Now())
+	if s := m.sessions[string(target)]; s != nil && s.role == roleAlice && s.outES == nil {
+		s.mu.Lock()
+		s.addPendingNS(state)
+		s.mu.Unlock()
+	} else {
+		m.sessions[string(target)] = newAliceSession(target, state, time.Now())
+	}
 	m.mu.Unlock()
 	return msg, nil
 }

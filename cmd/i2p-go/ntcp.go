@@ -56,10 +56,10 @@ func (r *Router) dropConn(to data.Hash) {
 }
 
 // Conn returns a cached NTCP2 connection to a router hash, dialing if
-// necessary.
+// necessary. Connections whose read loop has ended are re-dialed.
 func (r *Router) Conn(to data.Hash) (*ntcp2.Conn, error) {
 	r.connMu.Lock()
-	if c := r.conns[to]; c != nil {
+	if c := r.conns[to]; c != nil && !c.Dead() {
 		r.connMu.Unlock()
 		return c, nil
 	}
@@ -79,17 +79,53 @@ func (r *Router) Conn(to data.Hash) (*ntcp2.Conn, error) {
 	return r.DialRI(ri)
 }
 
+// dialFailTTL is how long a failed NTCP2 dial poisons a router. Routers
+// whose handshake consistently EOFs (measured on this network) would
+// otherwise burn ~3s per dial — twice, with SendI2NP's retry — on every
+// packet routed through their lease before failing over to another
+// gateway. The TTL keeps the cache self-healing: a router that recovers
+// is probed again within a minute.
+const dialFailTTL = 60 * time.Second
+
+// markDialFail remembers a failed dial for dialFailTTL.
+func (r *Router) markDialFail(to data.Hash) {
+	r.failMu.Lock()
+	r.failUntil[to] = time.Now().Add(dialFailTTL)
+	r.failMu.Unlock()
+}
+
+// dialFailed reports whether the router's dial is poisoned.
+func (r *Router) dialFailed(to data.Hash) bool {
+	r.failMu.Lock()
+	defer r.failMu.Unlock()
+	t, ok := r.failUntil[to]
+	return ok && time.Now().Before(t)
+}
+
+// clearDialFail un-poisons a router after a successful dial.
+func (r *Router) clearDialFail(to data.Hash) {
+	r.failMu.Lock()
+	delete(r.failUntil, to)
+	r.failMu.Unlock()
+}
+
 // DialRI dials a router's NTCP2 address through the upstream proxy
 // and performs the Alice handshake. On success the connection is
 // cached and its read loop dispatches inbound messages.
 func (r *Router) DialRI(ri *data.RouterInfo) (*ntcp2.Conn, error) {
 	to := ri.RouterHash()
 	r.connMu.Lock()
-	if c := r.conns[to]; c != nil {
+	if c := r.conns[to]; c != nil && !c.Dead() {
 		r.connMu.Unlock()
 		return c, nil
 	}
 	r.connMu.Unlock()
+	// Recently failed: skip the dial entirely so the caller fails over
+	// to another lease/gateway immediately instead of stalling on the
+	// doomed handshake.
+	if r.dialFailed(to) {
+		return nil, ErrNoRoute
+	}
 
 	addr, cfg, err := r.ntcp2Config(ri)
 	if err != nil {
@@ -99,26 +135,52 @@ func (r *Router) DialRI(ri *data.RouterInfo) (*ntcp2.Conn, error) {
 	dctx, dcancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer dcancel()
 	var tcp net.Conn
-	if r.pd != nil {
+	if host, _, err := net.SplitHostPort(addr); err == nil && isDirectDialHost(host) {
+		// Loopback and RFC1918 addresses never need the upstream
+		// proxy (and most SOCKS servers refuse to connect back to
+		// them): dial direct.
+		var nd net.Dialer
+		tcp, err = nd.DialContext(dctx, "tcp", addr)
+	} else if r.pd != nil {
 		tcp, err = r.pd.Dial(dctx, "tcp", addr)
 	} else {
 		var nd net.Dialer
 		tcp, err = nd.DialContext(dctx, "tcp", addr)
 	}
 	if err != nil {
+		r.markDialFail(to)
 		return nil, fmt.Errorf("router: dial %s: %w", addr, err)
 	}
 
 	c, err := ntcp2.HandshakeOutbound(tcp, cfg)
 	if err != nil {
 		tcp.Close()
+		r.markDialFail(to)
 		return nil, fmt.Errorf("router: ntcp2 handshake %s: %w", addr, err)
 	}
+	// A recovered router should be trusted again immediately.
+	r.clearDialFail(to)
 	// Bind the peer identity into the dispatch path (TunnelData must
 	// be attributable to its sender for IBEP validation).
 	from := ri.RouterHash()
 	c.OnI2NP = func(raw []byte) { r.HandleI2NPFrom(from, raw) }
 	c.OnRI = r.HandleRI
+	// Evict on session death so the next send re-dials: a cached
+	// dead conn silently swallows both sends (write error path) and
+	// — worse — the peer's replies (TunnelData for our inbound
+	// tunnels can only arrive on a live session; our published
+	// address is deliberately undialable from outside).
+	c.OnClose = func() {
+		r.connMu.Lock()
+		mine := r.conns[to] == c
+		if mine {
+			delete(r.conns, to)
+		}
+		r.connMu.Unlock()
+		if mine {
+			logf("ntcp2: session to %s ended: %s", to.ToI2PBase64()[:8], c.LastError)
+		}
+	}
 	go c.ReadLoop()
 
 	r.connMu.Lock()
@@ -131,6 +193,75 @@ func (r *Router) DialRI(ri *data.RouterInfo) (*ntcp2.Conn, error) {
 	r.conns[to] = c
 	r.connMu.Unlock()
 	return c, nil
+}
+
+// keepaliveLoop keeps every cached NTCP2 connection warm. The
+// upstream proxy reaps connections after ~10-12s idle (measured:
+// every session dies of EOF exactly 12s after establishment), which
+// silently kills the sessions our inbound tunnels' data must ride
+// on — TunnelData for our tunnels can only come back over a session
+// we dialed, since our published address is deliberately undialable
+// from outside. A DateTime block every 5s stays under the reaper;
+// it is ~8 bytes/s of keepalive traffic per peer. The loop also
+// re-dials the current inbound gateway when its session dropped:
+// the proxy handshake is flaky, and one attempt per tick self-heals.
+func (r *Router) keepaliveLoop() {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		r.connMu.Lock()
+		snapshot := make(map[data.Hash]*ntcp2.Conn, len(r.conns))
+		for k, v := range r.conns {
+			snapshot[k] = v
+		}
+		r.connMu.Unlock()
+		for to, c := range snapshot {
+			if c.Dead() {
+				continue
+			}
+			if err := c.Ping(); err != nil {
+				r.dropConn(to)
+			}
+		}
+		// Maintain a live session to the inbound tunnel's gateway:
+		// responses to everything we send arrive as TunnelData
+		// through it, and a dead gateway session means every reply
+		// is dropped on the floor.
+		if lease := r.Lease(); lease != nil {
+			r.connMu.Lock()
+			c := r.conns[lease.TunnelGW]
+			r.connMu.Unlock()
+			if c == nil || c.Dead() {
+				if _, err := r.Conn(lease.TunnelGW); err != nil {
+					logf("gateway session redial %s failed: %v", lease.TunnelGW.ToI2PBase64()[:8], err)
+				} else {
+					logf("gateway session redial %s ok", lease.TunnelGW.ToI2PBase64()[:8])
+				}
+			}
+		}
+	}
+}
+
+// isDirectDialHost reports whether a peer address should bypass the
+// upstream SOCKS proxy: loopback and RFC1918 targets are local by
+// definition, and proxies typically refuse them anyway. Hostnames are
+// resolved first — an RI may publish a name (peers treat unparseable
+// hosts as "unpublished" but still valid), and a name that resolves
+// to a local address is still a local peer.
+func isDirectDialHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate()
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() {
+			return true
+		}
+	}
+	return false
 }
 
 // ntcp2Config extracts Bob's "s"/"i" options and builds the outbound
@@ -192,6 +323,7 @@ func (r *Router) HandleI2NPFrom(from data.Hash, raw []byte) {
 	if err != nil {
 		return
 	}
+	logf("i2np <- %s: type %d len %d", from.ToI2PBase64()[:8], msg.Type, len(raw))
 	switch msg.Type {
 	case i2np.TypeDatabaseStore:
 		r.HandleDatabaseStore(msg)
@@ -250,6 +382,7 @@ func (r *Router) HandleRI(raw []byte, flood bool) {
 func (r *Router) HandleTunnelData(from data.Hash, msg *i2np.Message) {
 	td, err := i2np.ParseTunnelData(msg.Payload)
 	if err != nil {
+		logf("tunnel data: parse: %v", err)
 		return
 	}
 	r.tunMu.Lock()
@@ -259,11 +392,13 @@ func (r *Router) HandleTunnelData(from data.Hash, msg *i2np.Message) {
 	}
 	r.tunMu.Unlock()
 	if tun == nil {
+		logf("tunnel data: no tunnel for ID %d (from %s)", td.TunnelID, from.ToI2PBase64()[:8])
 		return
 	}
 	msgs, err := tun.HandleTunnelData(td, from)
 	if err != nil {
 		// Malformed or replayed: drop silently to keep the tunnel alive.
+		logf("tunnel data: pipeline: %v", err)
 		return
 	}
 	for _, m := range msgs {
@@ -277,8 +412,18 @@ func (r *Router) HandleTunnelData(from data.Hash, msg *i2np.Message) {
 func (r *Router) dispatchInbound(msg *i2np.Message) {
 	switch msg.Type {
 	case i2np.TypeGarlic:
-		cloves, err := r.garlic.DecryptMessage(msg.Payload)
+		// The GarlicMessage body is a 4-byte length + the ECIES
+		// ciphertext (Java GarlicMessage.readMessage strips the length;
+		// decrypting the raw body skews every field by 4 bytes and fails
+		// the MAC).
+		gm, err := i2np.ParseGarlicMessage(msg.Payload)
 		if err != nil {
+			logf("garlic: bad garlic message: %v", err)
+			return
+		}
+		cloves, err := r.garlic.DecryptMessage(gm.Data)
+		if err != nil {
+			logf("garlic: decrypt failed (%d bytes): %v", len(gm.Data), err)
 			return
 		}
 		for _, cl := range cloves {
@@ -303,6 +448,7 @@ func (r *Router) dispatchClove(cl *garlic.Clove) {
 	case i2np.TypeData:
 		dm, err := i2np.ParseDataMessage(cl.Msg.Payload)
 		if err != nil {
+			logf("clove: bad data message: %v", err)
 			return
 		}
 		r.stream.HandleMessage(dm.Data)

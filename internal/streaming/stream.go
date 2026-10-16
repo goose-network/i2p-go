@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -77,6 +78,10 @@ type Options struct {
 	ConnectWait   time.Duration // default 60s
 	InitialRTO    time.Duration // retransmit timeout before an RTT estimate, default 9s
 	Now           func() time.Time
+	// Log, when set, receives one line per dropped inbound packet —
+	// with an opaque network this is the only way to see why a
+	// connection attempt never completes.
+	Log *log.Logger
 }
 
 // Manager owns all streaming connections for our destination.
@@ -87,6 +92,7 @@ type Manager struct {
 	sender   PacketSender
 	opts     Options
 	now      func() time.Time
+	logf     func(string, ...any)
 
 	mu       sync.Mutex
 	notify   chan struct{} // closed + replaced on accept-queue changes
@@ -125,9 +131,14 @@ func NewManager(ourDest *data.Destination, signPriv ed25519.PrivateKey, sender P
 		sender:   sender,
 		opts:     opts,
 		now:      now,
+		logf:     func(string, ...any) {},
 		notify:   make(chan struct{}),
 		conns:    make(map[uint32]*Stream),
 		outbound: make(map[uint32]*Stream),
+	}
+	if opts.Log != nil {
+		l := opts.Log
+		m.logf = func(format string, args ...any) { l.Printf("stream "+format, args...) }
 	}
 	return m
 }
@@ -206,13 +217,16 @@ func (m *Manager) Accept(ctx context.Context) (*Stream, error) {
 func (m *Manager) HandleMessage(gz []byte) {
 	plain, proto, fromPort, toPort, err := DecompressPayload(gz)
 	if err != nil {
+		m.logf("inbound payload: decompress: %v", err)
 		return
 	}
 	if proto != 0 && proto != ProtoStreaming {
+		m.logf("inbound payload: proto %d not streaming", proto)
 		return // not for us
 	}
 	p, err := ParsePacket(plain)
 	if err != nil {
+		m.logf("inbound payload: parse: %v", err)
 		return
 	}
 	m.dispatch(p, fromPort, toPort)
@@ -441,6 +455,11 @@ type Stream struct {
 	remoteHash data.Hash
 	remotePort uint16
 	localPort  uint16
+
+	// transientSPK: an offline-signed remote's transient signing key,
+	// learned from the first offline-signed packet (the real key
+	// authorizes it; Java: con.setRemoteTransientSPK).
+	transientSPK []byte
 
 	// receiveStreamID: our ID (receiveStreamId field of our packets).
 	// sendStreamID: the peer's ID (sendStreamId field of our packets).
@@ -725,7 +744,7 @@ func (s *Stream) waitEstablished(ctx context.Context, deadline time.Time) error 
 		if err := s.checkDeadline(deadline); err != nil {
 			return err
 		}
-		s.waitNotify()
+		s.waitNotifyUntil(deadline)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -871,6 +890,12 @@ func (s *Stream) handlePacket(p *Packet, fromPort, toPort uint16) {
 		}
 		if p.OptionalFrom != nil && !s.remoteHash.Equal(data.DestinationHash(*p.OptionalFrom)) {
 			return // wrong destination
+		}
+		// An offline-signed remote reveals its transient key here;
+		// remember it so later packets without FROM verify against it
+		// (Java: con.setRemoteTransientSPK).
+		if p.Flags&FlagSignatureOffline != 0 && len(p.TransientSPK) == ed25519.PublicKeySize {
+			s.transientSPK = append([]byte(nil), p.TransientSPK...)
 		}
 	} else if p.Flags&FlagSYN != 0 && s.sendStreamID != 0 {
 		// An unsigned SYN once established: not authentic.
@@ -1143,7 +1168,9 @@ func (s *Stream) loop() {
 		if len(jobs) > 0 {
 			s.sendMu.Lock()
 			for _, raw := range jobs {
-				s.mgr.sender.SendPacket(s.remote, raw, s.localPort, s.remotePort)
+				if err := s.mgr.sender.SendPacket(s.remote, raw, s.localPort, s.remotePort); err != nil {
+					s.mgr.logf("send failed: %v", err)
+				}
 			}
 			s.sendMu.Unlock()
 		}
@@ -1188,8 +1215,13 @@ func (s *Stream) teardownLocked(err error) {
 	s.mgr.removeStream(s)
 }
 
-// remoteSPK returns the remote destination's Ed25519 public key.
+// remoteSPK returns the key that verifies the remote's signatures: the
+// learned transient key for an offline-signed remote, else the
+// destination's Ed25519 public key. Reference: Connection.getRemoteSPK.
 func (s *Stream) remoteSPK() ed25519.PublicKey {
+	if len(s.transientSPK) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(s.transientSPK)
+	}
 	if s.remote == nil || s.remote.SigType != data.SigEdDSA_SHA512_Ed25519 {
 		return nil
 	}
@@ -1199,14 +1231,11 @@ func (s *Stream) remoteSPK() ed25519.PublicKey {
 	return ed25519.PublicKey(s.remote.SigningKey)
 }
 
-// cloneDest copies a destination (packets alias their buffers).
+// cloneDest copies a destination (packets alias their buffers). It must
+// go through data's Clone: certRaw is unexported, so a field-by-field
+// copy would drop it and the clone would hash differently from the
+// original — the bug that sent eepsite lookups to the wrong key.
 func cloneDest(d *data.Destination) *data.Destination {
-	c := &data.Destination{
-		EncKey:     append([]byte(nil), d.EncKey...),
-		SigningKey: append([]byte(nil), d.SigningKey...),
-		SigType:    d.SigType,
-		EncType:    d.EncType,
-		Pad:        append([]byte(nil), d.Pad...),
-	}
-	return c
+	c := d.Clone()
+	return &c
 }

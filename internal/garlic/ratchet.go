@@ -379,14 +379,22 @@ func noiseSplit(state *noise.HandshakeState) splitKeys {
 // Reference: OutboundSession ctor (initiator branch).
 func newAliceSession(target []byte, state *noise.HandshakeState, now time.Time) *Session {
 	s := &Session{Target: append([]byte(nil), target...), role: roleAlice, established: now}
-	// Expected NSR tagset: rootKey = ck-after-msg1, data = HKDF(ck, "",
-	// "SessionReplyTags"), 12 tags.
+	s.addPendingNS(state)
+	return s
+}
+
+// addPendingNS records a post-msg1 handshake state awaiting the NSR,
+// with its reply-tag set. Called for every NS we send while the
+// handshake is still open: a retransmitted SYN produces a fresh NS, but
+// the NSR for the earlier NS may still be in flight — dropping the
+// earlier state here would make that NSR unmatchable and stall the
+// connection until it times out. Reference: OutboundSession keeps the
+// prior session until the handshake completes.
+func (s *Session) addPendingNS(state *noise.HandshakeState) {
 	ck := state.ChainingKey()
 	tagsetKey := i2pcrypto.HKDF(ck, nil, infoSessionReplyTags)
-	ts := newInboundNSRTagSet(state, ck, tagsetKey)
-	s.nsrTagSets = append(s.nsrTagSets, ts)
+	s.nsrTagSets = append(s.nsrTagSets, newInboundNSRTagSet(state, ck, tagsetKey))
 	s.pending = append(s.pending, state)
-	return s
 }
 
 // newBobSession creates a Bob-side session: after receiving the NS and

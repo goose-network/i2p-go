@@ -9,6 +9,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/goose-network/i2p-go/internal/data"
@@ -35,12 +37,17 @@ func (p *pendingBuild) Finish(reply *i2np.Message) {
 	}
 }
 
-// tunnelCandidates picks routers to build inbound tunnels through:
-// reachable (not "LU"), with a usable NTCP2 address. Floodfills are
-// avoided as tunnel peers (they carry netdb traffic, not client
-// tunnels — reference: TunnelPeerBuilder).
+// tunnelCandidates picks routers to build inbound tunnels through. The
+// hop is also the gateway published in our LeaseSet2's lease: remote
+// senders deliver reply garlic to it as a TunnelGatewayMessage, so it
+// must be publicly reachable — a NAT'd or loopback gateway strands
+// every reply (senders cannot even connect to deliver). Routers with
+// a public NTCP2 address and "reachable" caps are preferred; routers
+// without them are kept as last resort. Floodfills are avoided as
+// tunnel peers (they carry netdb traffic, not client tunnels —
+// reference: TunnelPeerBuilder).
 func (r *Router) tunnelCandidates(n int) []*data.RouterInfo {
-	var out []*data.RouterInfo
+	var reach, pub, rest []*data.RouterInfo
 	for _, ri := range r.db.AllRouters() {
 		if netdb.IsFloodfill(ri) {
 			continue
@@ -51,12 +58,44 @@ func (r *Router) tunnelCandidates(n int) []*data.RouterInfo {
 		if !hasNTCP2(ri) {
 			continue
 		}
-		out = append(out, ri)
-		if len(out) >= n {
-			break
+		switch {
+		case isPublicRouter(ri) && strings.Contains(ri.Options["caps"], "U"):
+			reach = append(reach, ri)
+		case isPublicRouter(ri):
+			pub = append(pub, ri)
+		default:
+			rest = append(rest, ri)
 		}
 	}
+	out := append(append(reach, pub...), rest...)
+	if len(out) > n {
+		out = out[:n]
+	}
 	return out
+}
+
+// isPublicRouter reports whether the router's NTCP2 address is a
+// public IP literal (routable from anywhere).
+func isPublicRouter(ri *data.RouterInfo) bool {
+	for _, a := range ri.Addresses {
+		if a.TransportStyle != "NTCP2" {
+			continue
+		}
+		host := a.Options["host"]
+		ip := net.ParseIP(host)
+		if ip == nil {
+			continue // hostname or placeholder: not directly routable
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1]&0xc0 == 64 {
+			continue // CGNAT 100.64.0.0/10
+		}
+		return true
+	}
+	return false
 }
 
 // hasNTCP2 checks the RI for a usable NTCP2 address.
@@ -164,11 +203,22 @@ func (r *Router) rebuildLoop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		if err := r.BuildInbound(ctx); err != nil {
 			logf("inbound tunnel rebuild failed: %v", err)
-		} else {
-			// Republish the LeaseSet2 with the new lease.
+			cancel()
+			continue
+		}
+		// Republish the LeaseSet2 with the new lease; a store failure
+		// (unreachable floodfills) is retried after a minute — without
+		// a published lease, no remote can route replies back to us.
+		for try := 1; ; try++ {
 			if err := r.PublishLeaseSet(ctx); err != nil {
-				logf("leaseset republish failed: %v", err)
+				logf("leaseset republish failed (try %d): %v", try, err)
+				select {
+				case <-time.After(time.Minute):
+					continue
+				case <-ctx.Done():
+				}
 			}
+			break
 		}
 		cancel()
 	}

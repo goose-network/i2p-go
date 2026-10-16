@@ -29,6 +29,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/goose-network/i2p-go/internal/data"
 )
@@ -78,6 +79,15 @@ type Packet struct {
 	OptionalMaxSize uint16
 	OptionalSig     []byte
 
+	// Offline signing block (FlagSignatureOffline): the destination's
+	// real key authorizes a transient key until TransientExpires, and
+	// the transient key signs the packet. Common for long-lived sites
+	// (zzz.i2p) whose private key lives offline.
+	TransientExpires uint32 // unix seconds
+	TransientSigType data.SigType
+	TransientSPK     []byte // typed by TransientSigType
+	OfflineSignature []byte // by the FROM's (real) key
+
 	Payload []byte
 }
 
@@ -105,6 +115,9 @@ func (p *Packet) encode(fakeSigLen int) []byte {
 	}
 	if p.Flags&FlagMaxPacketSize != 0 {
 		optionSize += 2
+	}
+	if p.Flags&FlagSignatureOffline != 0 {
+		optionSize += 6 + len(p.TransientSPK) + len(p.OfflineSignature)
 	}
 	if p.Flags&FlagSignatureIncluded != 0 {
 		if fakeSigLen > 0 {
@@ -139,6 +152,12 @@ func (p *Packet) encode(fakeSigLen int) []byte {
 			max = defaultMaxPacketSize
 		}
 		buf = binary.BigEndian.AppendUint16(buf, max)
+	}
+	if p.Flags&FlagSignatureOffline != 0 {
+		buf = binary.BigEndian.AppendUint32(buf, p.TransientExpires)
+		buf = binary.BigEndian.AppendUint16(buf, uint16(p.TransientSigType))
+		buf = append(buf, p.TransientSPK...)
+		buf = append(buf, p.OfflineSignature...)
 	}
 	if p.Flags&FlagSignatureIncluded != 0 {
 		if fakeSigLen > 0 {
@@ -213,11 +232,46 @@ func ParsePacket(b []byte) (*Packet, error) {
 		p.OptionalMaxSize = binary.BigEndian.Uint16(b[off:])
 		off += 2
 	}
+	if p.Flags&FlagSignatureOffline != 0 {
+		// [expires 4s][sig type 2][typed SPK][offline signature]. The
+		// offline signature's length is fixed by the FROM's sig type
+		// (the real key that made it). Reference: Packet.readBytes.
+		if off+6 > optEnd {
+			return nil, fmt.Errorf("streaming: short offline block")
+		}
+		p.TransientExpires = binary.BigEndian.Uint32(b[off:])
+		p.TransientSigType = data.SigType(binary.BigEndian.Uint16(b[off+4:]))
+		off += 6
+		spkLen := p.TransientSigType.PubkeyLen()
+		if spkLen < 0 || off+spkLen > optEnd {
+			return nil, fmt.Errorf("streaming: bad transient key type %d", p.TransientSigType)
+		}
+		p.TransientSPK = b[off : off+spkLen]
+		off += spkLen
+		offLen := 64
+		if p.OptionalFrom != nil {
+			if l := sigLenFor(p.OptionalFrom.SigType); l > 0 {
+				offLen = l
+			}
+		}
+		if off+offLen > optEnd {
+			return nil, fmt.Errorf("streaming: short offline signature")
+		}
+		p.OfflineSignature = b[off : off+offLen]
+		off += offLen
+	}
 	if p.Flags&FlagSignatureIncluded != 0 {
 		sigLen := optEnd - off
+		sigType := data.SigEdDSA_SHA512_Ed25519
 		if p.OptionalFrom != nil {
-			// The FROM's sig type fixes the length.
-			switch p.OptionalFrom.SigType {
+			// The FROM's sig type fixes the length — unless the packet
+			// is signed offline, where the transient key's type does
+			// (Java: Packet.readBytes FLAG_SIGNATURE_INCLUDED).
+			sigType = p.OptionalFrom.SigType
+			if p.Flags&FlagSignatureOffline != 0 {
+				sigType = p.TransientSigType
+			}
+			switch sigType {
 			case data.SigEdDSA_SHA512_Ed25519, data.SigRedDSA_SHA512_Ed25519:
 				if sigLen < 64 {
 					return nil, fmt.Errorf("streaming: short signature %d", sigLen)
@@ -254,7 +308,10 @@ func (p *Packet) Sign(priv ed25519.PrivateKey) {
 // Verify checks the packet signature. spk is the expected signer's
 // public key — the FROM's key when the packet carries a FROM (Java:
 // verifySignature prefers the FROM), otherwise the caller's known
-// remote key.
+// remote key. An offline-signed packet is verified in two steps: the
+// destination's real key must have authorized the transient key (the
+// offline signature over expires + type + SPK, unexpired), and the
+// transient key must have signed the packet.
 func (p *Packet) Verify(spk ed25519.PublicKey) bool {
 	if p.Flags&FlagSignatureIncluded == 0 || len(p.OptionalSig) != ed25519.SignatureSize {
 		return false
@@ -268,8 +325,37 @@ func (p *Packet) Verify(spk ed25519.PublicKey) bool {
 	if len(spk) != ed25519.PublicKeySize {
 		return false
 	}
+	if p.Flags&FlagSignatureOffline != 0 {
+		if uint64(p.TransientExpires) < uint64(time.Now().Unix()) {
+			return false // transient key expired
+		}
+		var block []byte
+		block = binary.BigEndian.AppendUint32(block, p.TransientExpires)
+		block = binary.BigEndian.AppendUint16(block, uint16(p.TransientSigType))
+		block = append(block, p.TransientSPK...)
+		if !ed25519.Verify(spk, block, p.OfflineSignature) {
+			return false // transient key not authorized by the real key
+		}
+		spk = ed25519.PublicKey(p.TransientSPK)
+		if len(spk) != ed25519.PublicKeySize {
+			return false
+		}
+	}
 	buf := p.encode(ed25519.SignatureSize)
 	return ed25519.Verify(spk, buf, p.OptionalSig)
+}
+
+// sigLenFor returns the encoded signature length for a sig type
+// (mirrors data's unexported helper; only the types the streaming
+// layer can verify are listed).
+func sigLenFor(t data.SigType) int {
+	switch t {
+	case data.SigDSA_SHA1:
+		return 40
+	case data.SigEdDSA_SHA512_Ed25519, data.SigRedDSA_SHA512_Ed25519:
+		return 64
+	}
+	return -1
 }
 
 // String renders a compact one-line description for logs.

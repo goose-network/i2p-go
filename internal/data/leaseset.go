@@ -333,13 +333,31 @@ func (ls *LeaseSet2) Verify() error {
 		}
 		return nil
 	}
-	if len(ls.Destination.SigningKey) != ed25519.PublicKeySize {
-		return fmt.Errorf("ls2: bad destination signing key length %d", len(ls.Destination.SigningKey))
+	return ls.verifyOnline(msg)
+}
+
+// verifyOnline checks the online LS2 signature, dispatching on the
+// destination's signing algorithm: DSA_SHA1 (legacy eepsites, I2P's
+// fixed parameters) or Ed25519 (the modern default).
+func (ls *LeaseSet2) verifyOnline(msg []byte) error {
+	switch ls.Destination.SigType {
+	case SigDSA_SHA1:
+		if len(ls.Destination.SigningKey) != 128 {
+			return fmt.Errorf("ls2: bad DSA signing key length %d", len(ls.Destination.SigningKey))
+		}
+		if !verifyDSA_SHA1(ls.Signature, msg, ls.Destination.SigningKey) {
+			return fmt.Errorf("ls2: DSA signature verification failed")
+		}
+		return nil
+	default:
+		if len(ls.Destination.SigningKey) != ed25519.PublicKeySize {
+			return fmt.Errorf("ls2: bad destination signing key length %d", len(ls.Destination.SigningKey))
+		}
+		if !ed25519.Verify(ed25519.PublicKey(ls.Destination.SigningKey), msg, ls.Signature) {
+			return fmt.Errorf("ls2: signature verification failed")
+		}
+		return nil
 	}
-	if !ed25519.Verify(ed25519.PublicKey(ls.Destination.SigningKey), msg, ls.Signature) {
-		return fmt.Errorf("ls2: signature verification failed")
-	}
-	return nil
 }
 
 // LeaseSet is the legacy LS1 (DatabaseEntry type 1). Only parsing is

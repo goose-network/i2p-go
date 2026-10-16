@@ -70,10 +70,13 @@ const (
 )
 
 // Certificate is an I2P certificate blob. Only the key certificate
-// (type 5) matters to us; the others are carried opaque.
+// (type 5) matters to us; the others are carried opaque. Raw keeps the
+// exact parsed bytes: identities and destinations hash over them, so
+// round-trips must re-emit the parsed certificate verbatim.
 type Certificate struct {
 	Type    int
 	Payload []byte
+	Raw     []byte
 }
 
 // ReadCertificate parses a certificate at the head of b.
@@ -91,7 +94,7 @@ func ReadCertificate(b []byte) (Certificate, []byte, error) {
 	if plen > 0 {
 		payload = append([]byte(nil), b[3:3+plen]...)
 	}
-	return Certificate{Type: t, Payload: payload}, b[3+plen:], nil
+	return Certificate{Type: t, Payload: payload, Raw: append([]byte(nil), b[:3+plen]...)}, b[3+plen:], nil
 }
 
 // WriteCertificate appends the certificate encoding.

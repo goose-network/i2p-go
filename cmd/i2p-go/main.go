@@ -54,17 +54,18 @@ func main() {
 		upstream  = flag.String("upstream", "127.0.0.1:7890", "upstream SOCKS5 proxy for outbound connections (empty = direct)")
 		hostsFile = flag.String("hosts", "", "addressbook hosts.txt (name = base64 destination)")
 		seedURL   = flag.String("seed", "", "reseed URL (default: try the known list)")
+		netdbDir  = flag.String("netdb", "netdb", "netdb directory (i2pd on-disk format)")
 	)
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	if err := run(*socksAddr, *upstream, *hostsFile, *seedURL); err != nil {
+	if err := run(*socksAddr, *upstream, *hostsFile, *seedURL, *netdbDir); err != nil {
 		log.Fatalf("i2p-go: %v", err)
 	}
 }
 
 // run starts the router and blocks serving SOCKS5 until failure.
-func run(socksAddr, upstream, hostsFile, seedURL string) error {
+func run(socksAddr, upstream, hostsFile, seedURL, netdbDir string) error {
 	ctx := context.Background()
 
 	var pd *proxy.Dialer
@@ -77,6 +78,13 @@ func run(socksAddr, upstream, hostsFile, seedURL string) error {
 		return err
 	}
 	log.Printf("router %s up (b32 %s)", r.ri.RouterHash().ToI2PBase64()[:12], r.dest.Base32Address())
+
+	// 0. Load the persisted netdb (i2pd on-disk format).
+	if netdbDir != "" {
+		if n, err := netdb.LoadPersisted(netdbDir, r.db); err == nil && n > 0 {
+			log.Printf("netdb: loaded %d routers from %s", n, netdbDir)
+		}
+	}
 
 	// 1. Reseed if the netdb has no floodfills.
 	if len(r.db.Floodfills()) == 0 {
@@ -94,13 +102,33 @@ func run(socksAddr, upstream, hostsFile, seedURL string) error {
 			return fmt.Errorf("reseed: %w", err)
 		}
 		nff := 0
+		var ageMin, ageMax time.Duration
 		for _, ri := range ris {
 			r.db.StoreRI(ri)
 			if netdb.IsFloodfill(ri) {
 				nff++
 			}
+			if a := time.Since(ri.Published); a > ageMax {
+				ageMax = a
+			}
+			if ageMin == 0 || time.Since(ri.Published) < ageMin {
+				ageMin = time.Since(ri.Published)
+			}
 		}
-		log.Printf("reseed: %d routers (%d floodfills)", len(ris), nff)
+		log.Printf("reseed: %d routers (%d floodfills), RI age %s..%s", len(ris), nff, ageMin.Round(time.Second), ageMax.Round(time.Second))
+	}
+
+	// 0b. Persist the netdb periodically (after reseed and discovery).
+	if netdbDir != "" {
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for range t.C {
+				if err := r.db.Persist(netdbDir); err != nil {
+					log.Printf("netdb: persist: %v", err)
+				}
+			}
+		}()
 	}
 
 	// 2. Build one inbound tunnel through a non-floodfill router.
@@ -108,13 +136,18 @@ func run(socksAddr, upstream, hostsFile, seedURL string) error {
 		return fmt.Errorf("inbound tunnel: %w", err)
 	}
 
-	// 3. Publish our LeaseSet2 (our leases) to a floodfill.
+	// 3. Publish our LeaseSet2 (our leases) to a floodfill. Non-fatal:
+	// a single unreachable floodfill at startup shouldn't kill the
+	// router; the rebuild loop retries the publish alongside the tunnel.
 	if err := r.PublishLeaseSet(ctx); err != nil {
-		return fmt.Errorf("leaseset publish: %w", err)
+		log.Printf("leaseset publish: %v (will retry with tunnel rebuild)", err)
 	}
 
-	// 4. Keep the tunnel alive.
+	// 4. Keep the tunnel alive, and the NTCP2 sessions beneath it
+	// (idle sessions are reaped by the proxy and peers; replies ride
+	// on the session to the inbound gateway).
 	go r.rebuildLoop()
+	go r.keepaliveLoop()
 
 	// 5. Load the addressbook.
 	if hostsFile != "" {
@@ -131,7 +164,7 @@ func run(socksAddr, upstream, hostsFile, seedURL string) error {
 		return err
 	}
 	log.Printf("SOCKS5 listening on %s", socksAddr)
-	srv := &socks5.Server{Resolver: r, Dialer: r.stream}
+	srv := &socks5.Server{Resolver: r, Dialer: r.stream, Log: log.Default()}
 	return srv.Serve(l)
 }
 
@@ -162,9 +195,23 @@ type Router struct {
 	connMu sync.Mutex
 	conns  map[data.Hash]*ntcp2.Conn
 
+	// NTCP2 dial-failure cache: routers whose handshake recently failed
+	// are not re-dialed for dialFailTTL. Measured on this network, some
+	// routers consistently close our NTCP2 handshake at msg2 (~3s burned
+	// per dial, doubled by SendI2NP's internal retry), and without this
+	// cache every packet to a remote whose freshest lease points there
+	// stalls behind those dead dials before failing over.
+	failMu    sync.Mutex
+	failUntil map[data.Hash]time.Time
+
 	// Addressbook.
 	hostMu sync.Mutex
 	hosts  map[string]*data.Destination
+
+	// LeaseSet2 attach bookkeeping: the publish time of the LeaseSet2
+	// each remote has been told about (see ls2AttachClove).
+	lsMu   sync.Mutex
+	lsSent map[data.Hash]time.Time
 }
 
 // NewRouter generates all identities and wires the layers.
@@ -184,7 +231,8 @@ func NewRouter(pd *proxy.Dialer) (*Router, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Client garlic (ratchet) key.
+	// Client garlic (ratchet) key: the type-4 key published in our
+	// LeaseSet2 that remotes' garlic is encrypted to.
 	var gp [32]byte
 	if _, err := rand.Read(gp[:]); err != nil {
 		return nil, err
@@ -193,24 +241,37 @@ func NewRouter(pd *proxy.Dialer) (*Router, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	r := &Router{
-		pd:       pd,
-		signPriv: sp,
-		ntcpPriv: np,
-		destPriv: dp,
-		garlic:   gm,
-		tunB:     make(map[uint32]*pendingBuild),
-		conns:    make(map[data.Hash]*ntcp2.Conn),
-		hosts:    make(map[string]*data.Destination),
+	// Client destination ElGamal key. The destination itself must be
+	// ElGamal (enc type 0): Java's I2CP rejects EncType-4 client
+	// destinations, and the Java streaming parser's FROM handling only
+	// computes the right field size for an ElGamal destination
+	// (Destination.size() double-counts key-certificate padding).
+	// Remotes reach us with the LeaseSet2's type-4 ratchet key instead.
+	elgPub, _, err := data.GenerateElGamalKeyPair()
+	if err != nil {
+		return nil, err
 	}
 
-	// Client destination: Ed25519 + ECIES-Ratchet (enc type 4).
+	r := &Router{
+		pd:        pd,
+		signPriv:  sp,
+		ntcpPriv:  np,
+		destPriv:  dp,
+		garlic:    gm,
+		tunB:      make(map[uint32]*pendingBuild),
+		conns:     make(map[data.Hash]*ntcp2.Conn),
+		failUntil: make(map[data.Hash]time.Time),
+		hosts:     make(map[string]*data.Destination),
+		lsSent:    make(map[data.Hash]time.Time),
+	}
+
+	// Client destination: Ed25519 + ElGamal (enc type 0), like every
+	// Java client destination; the ratchet key rides the LeaseSet2.
 	r.dest = &data.Destination{
-		EncKey:     gm.PublicKey(),
+		EncKey:     elgPub,
 		SigningKey: dp.Public().(ed25519.PublicKey),
 		SigType:    data.SigEdDSA_SHA512_Ed25519,
-		EncType:    data.EncECIES_X25519,
+		EncType:    data.EncElGamal2048,
 	}
 
 	// Router identity: X25519 encryption key (same key as NTCP2 "s"),
@@ -227,7 +288,9 @@ func NewRouter(pd *proxy.Dialer) (*Router, error) {
 	}
 	r.db = netdb.New(ident.RouterHash())
 	r.lookup = netdb.NewLookupClient(r.db, r)
+	r.lookup.Log = log.Default()
 	r.store = netdb.NewStoreClient(r.db, r)
+	r.store.Log = log.Default()
 
 	ri, err := buildRouterInfo(ident, sp, npub)
 	if err != nil {
@@ -236,7 +299,7 @@ func NewRouter(pd *proxy.Dialer) (*Router, error) {
 	r.ri = ri
 
 	// Streaming over the garlic send path.
-	r.stream = streaming.NewManager(r.dest, dp, r, streaming.Options{})
+	r.stream = streaming.NewManager(r.dest, dp, r, streaming.Options{Log: log.Default()})
 	return r, nil
 }
 
