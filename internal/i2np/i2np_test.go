@@ -58,12 +58,12 @@ func TestHeaderRoundTrip(t *testing.T) {
 func TestDatabaseStoreRoundTrip(t *testing.T) {
 	ri, _, _ := testRI(t)
 	m := &DatabaseStore{
-		Key:         data.Hash(sha(ri.Bytes())),
-		Kind:        DbRouterInfo,
-		ReplyToken:  7,
-		ReplyTunnel: 9,
+		Key:          data.Hash(sha(ri.Bytes())),
+		Kind:         DbRouterInfo,
+		ReplyToken:   7,
+		ReplyTunnel:  9,
 		ReplyGateway: data.Hash(sha([]byte("gateway"))),
-		RouterInfo:  ri.Bytes(),
+		RouterInfo:   ri.Bytes(),
 	}
 	got, err := ParseDatabaseStore(m.Payload())
 	if err != nil {
@@ -202,7 +202,7 @@ func buildTestRI(t *testing.T) (data.RouterInfo, []byte) {
 		},
 		Published: time.UnixMilli(1700000000000),
 		Options: map[string]string{
-			"caps": "R",
+			"caps":  "R",
 			"netId": "2",
 		},
 	}

@@ -43,6 +43,34 @@ var XK = Pattern{
 	{S, SE},
 }
 
+// IK is the ECIES-Ratchet client garlic pattern: -> e es s ss,
+// <- e ee se. The protocol name is "Noise_IKelg2+hs2_25519_
+// ChaChaPoly_SHA256" (39 bytes > 32, so ck starts as its SHA-256).
+// The first 32 bytes of the first message are an Elligator2-encoded
+// ephemeral key, overwritten after writeMessage by the caller.
+// Reference: NoiseInit.PatternID.IK.
+var IK = Pattern{
+	{E, ES, S, SS},
+	{E, EE, SE},
+}
+
+// N is the short tunnel build record pattern: -> e es, with no
+// response. The protocol name is "Noise_N_25519_ChaChaPoly_SHA256".
+// The initiator has no static key; the responder's static key is
+// the hop's ratchet key. Reference: NoiseInit.PatternID.N and
+// BuildRequestRecord.encryptECIESRecord.
+var N = Pattern{
+	{E, ES},
+}
+
+// NNoResponse is the anonymous netdb garlic pattern ("N!"), identical
+// to N. The I2P code uses a separate enum value so the caller knows
+// no post-mixHash is needed, but the token sequence is the same.
+// Reference: NoiseInit.PatternID.N_NO_RESPONSE.
+var NNoResponse = Pattern{
+	{E, ES},
+}
+
 // SymmetricState holds the Noise chaining key ck, the handshake hash h,
 // and the current message cipher.
 // Reference: SymmetricState.java.
@@ -130,6 +158,20 @@ func (s *SymmetricState) HandshakeHash() []byte {
 	return append([]byte(nil), s.h[:]...)
 }
 
+// clone deep-copies the symmetric state. The message cipher's nonce
+// counter must be preserved: the handshake payload of each message is
+// encrypted with the cipher at its current counter, and a cloned
+// state (e.g. a stored post-msg1 state processing an NSR) must use
+// the same counter as the side that advanced it.
+func (s *SymmetricState) clone() *SymmetricState {
+	c := &SymmetricState{ck: s.ck, h: s.h}
+	if s.cipher != nil {
+		c.cipher = i2pcrypto.NewAEAD(s.cipher.Key())
+		c.cipher.SetNonce(s.cipher.Nonce())
+	}
+	return c
+}
+
 // HandshakeState executes a Noise handshake. Reference: HandshakeState.java.
 type HandshakeState struct {
 	symmetric *SymmetricState
@@ -142,8 +184,14 @@ type HandshakeState struct {
 
 	localStaticPriv, localStaticPub []byte // s
 	localEphemPriv, localEphemPub   []byte // e
-	remoteStatic                    []byte // rs (Bob's s, known to Alice for XK)
-	remoteEphem                     []byte // re
+	// ephReady: a caller-provided ephemeral (GenerateEphemeralPair)
+	// is waiting to be written into the next message's E token.
+	// WriteMessage clears it after use so subsequent messages get
+	// fresh keys. Reference: Java passes an Elligator2 key factory to
+	// the HandshakeState ctor for the same effect.
+	ephReady     bool
+	remoteStatic []byte // rs (Bob's s, known to Alice for XK)
+	remoteEphem  []byte // re
 }
 
 // NewHandshakeState creates a handshake for pattern (XK or IK), with
@@ -223,7 +271,9 @@ func (h *HandshakeState) LocalEphemeral() []byte {
 }
 
 // GenerateEphemeralPair generates the ephemeral keypair used for the
-// next message. Reference: HandshakeState E-token handling.
+// next message. The next written E token will use this pair instead of
+// generating a fresh one, so callers can pre-select properties (e.g.
+// Elligator2 encodability). Reference: HandshakeState E-token handling.
 func (h *HandshakeState) GenerateEphemeralPair() error {
 	h.localEphemPriv = make([]byte, 32)
 	if _, err := rand.Read(h.localEphemPriv); err != nil {
@@ -234,7 +284,44 @@ func (h *HandshakeState) GenerateEphemeralPair() error {
 		return err
 	}
 	h.localEphemPub = pub
+	h.ephReady = true
 	return nil
+}
+
+// SetEphemeralPair installs a caller-supplied ephemeral keypair for the
+// next written E token (used to guarantee an Elligator2-encodable key).
+func (h *HandshakeState) SetEphemeralPair(priv, pub []byte) {
+	h.localEphemPriv = append([]byte(nil), priv...)
+	h.localEphemPub = append([]byte(nil), pub...)
+	h.ephReady = true
+}
+
+// Clone deep-copies the handshake state (the stored post-msg1 state is
+// cloned per NSR tag hit). Reference: HandshakeState.clone.
+func (h *HandshakeState) Clone() (*HandshakeState, error) {
+	c := &HandshakeState{
+		symmetric: h.symmetric.clone(),
+		pattern:   h.pattern,
+		msgIndex:  h.msgIndex,
+		initiator: h.initiator,
+		action:    h.action,
+		ephReady:  h.ephReady,
+	}
+	if h.localStaticPriv != nil {
+		c.localStaticPriv = append([]byte(nil), h.localStaticPriv...)
+		c.localStaticPub = append([]byte(nil), h.localStaticPub...)
+	}
+	if h.localEphemPriv != nil {
+		c.localEphemPriv = append([]byte(nil), h.localEphemPriv...)
+		c.localEphemPub = append([]byte(nil), h.localEphemPub...)
+	}
+	if h.remoteStatic != nil {
+		c.remoteStatic = append([]byte(nil), h.remoteStatic...)
+	}
+	if h.remoteEphem != nil {
+		c.remoteEphem = append([]byte(nil), h.remoteEphem...)
+	}
+	return c, nil
 }
 
 // Action returns the current action: "write", "read", or "split".
@@ -266,9 +353,12 @@ func (h *HandshakeState) WriteMessage(payload []byte) ([]byte, error) {
 	for _, tok := range h.pattern[h.msgIndex] {
 		switch tok {
 		case E:
-			if err := h.GenerateEphemeralPair(); err != nil {
-				return nil, err
+			if !h.ephReady {
+				if err := h.GenerateEphemeralPair(); err != nil {
+					return nil, err
+				}
 			}
+			h.ephReady = false
 			out = append(out, h.localEphemPub...)
 			h.symmetric.MixHash(h.localEphemPub)
 		case S:

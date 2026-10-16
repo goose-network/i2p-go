@@ -43,6 +43,9 @@ func NewAEAD(key []byte) *AEAD {
 // SetNonce sets the message counter.
 func (a *AEAD) SetNonce(n uint64) { a.n = n }
 
+// Key returns a copy of the AEAD key (for state cloning).
+func (a *AEAD) Key() []byte { return append([]byte(nil), a.key[:]...) }
+
 // Nonce returns the message counter.
 func (a *AEAD) Nonce() uint64 { return a.n }
 

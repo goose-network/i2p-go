@@ -221,11 +221,11 @@ func ParseDatabaseStore(b []byte) (*DatabaseStore, error) {
 // DatabaseLookup queries the floodfill netdb.
 // Reference: DatabaseLookupMessage.
 type DatabaseLookup struct {
-	Key        data.Hash
-	From       data.Hash
-	Flags      byte
+	Key         data.Hash
+	From        data.Hash
+	Flags       byte
 	ReplyTunnel uint32
-	Peers      []data.Hash
+	Peers       []data.Hash
 	// ReplyKey: with FlagRatchet, the X25519 reply public key.
 	ReplyKey data.Hash
 	// ReplyTags: with FlagEncrypt, ElGamal session tags (unused now).
@@ -368,8 +368,8 @@ func ParseDatabaseSearchReply(b []byte) (*DatabaseSearchReply, error) {
 // DeliveryStatus is a receipt/test message.
 // Reference: DeliveryStatusMessage.
 type DeliveryStatus struct {
-	ID       uint32
-	Arrival  time.Time
+	ID      uint32
+	Arrival time.Time
 }
 
 // Payload serializes the body (exactly 12 bytes).
