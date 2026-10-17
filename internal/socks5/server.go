@@ -1,7 +1,9 @@
 // Package socks5 implements a SOCKS5 CONNECT-only proxy front end
 // for I2P: it accepts local SOCKS5 clients, resolves .i2p hostnames
 // (.b32.i2p via netdb LeaseSet lookups, long base64 strings as inline
-// destinations), and bridges them to streaming connections.
+// destinations), and bridges them to streaming connections. Non-I2P
+// hosts are refused unless an outproxy is configured, in which case
+// they are relayed through it (outproxy.go).
 //
 // Reference: apps/i2ptunnel/java/src/net/i2p/i2ptunnel/socks/
 // SOCKS5Server.java in the Java router (../i2p.i2p).
@@ -49,7 +51,13 @@ type Dialer interface {
 type Server struct {
 	Resolver Resolver
 	Dialer   Dialer
+	// Outproxy, if non-nil, relays CONNECTs to non-I2P hosts (see
+	// OutproxyConfig). Without it they are refused.
+	Outproxy *OutproxyConfig
 	Log      *log.Logger
+
+	opMu    sync.Mutex
+	opCache map[string]*data.Destination
 }
 
 // Serve accepts connections until the listener closes, handling each
@@ -114,6 +122,15 @@ func (s *Server) handleConn(c net.Conn) {
 		return
 	}
 	logf("CONNECT %s:%d", host, port)
+
+	// Non-I2P hosts go to the outproxy when one is configured;
+	// localhost is refused either way. Reference: the branch order in
+	// SOCKS5Server.getDestinationI2PSocket (isI2PHost → localhost →
+	// outproxy).
+	if s.Outproxy != nil && !isI2PHostForm(host) && !isLocalHost(host) {
+		s.handleOutproxy(c, host, port, logf)
+		return
+	}
 
 	dest, err := s.resolve(c, host, logf)
 	if err != nil {
@@ -227,6 +244,35 @@ func isB32Host(host string) (plain, blinded bool) {
 	return false, false
 }
 
+// isI2PHostForm reports whether host is shaped like an I2P target:
+// a .i2p/.i2p.alt name, a .b32 host, or an inline base64 destination.
+// Reference: NamingService.isI2PHost.
+func isI2PHostForm(host string) bool {
+	lower := strings.ToLower(host)
+	if strings.HasSuffix(lower, ".i2p") || strings.HasSuffix(lower, ".i2p.alt") {
+		return true
+	}
+	if plain, blinded := isB32Host(host); plain || blinded {
+		return true
+	}
+	return len(host) >= minBase64DestLen
+}
+
+// isLocalHost reports whether host targets the local machine or LAN,
+// which must never be tunneled to I2P. Reference: SOCKS5Server
+// localhost checks.
+func isLocalHost(host string) bool {
+	lower := strings.ToLower(host)
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
+		host == "127.0.0.1" || host == "[::1]" || strings.HasPrefix(host, "192.168.") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 // resolve turns the requested host into a destination, sending the
 // appropriate failure reply on error.
 func (s *Server) resolve(c net.Conn, host string, logf func(string, ...any)) (*data.Destination, error) {
@@ -234,8 +280,7 @@ func (s *Server) resolve(c net.Conn, host string, logf func(string, ...any)) (*d
 
 	// Local addresses must not be tunneled to I2P.
 	// Reference: SOCKS5Server localhost check.
-	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
-		host == "127.0.0.1" || host == "[::1]" || strings.HasPrefix(host, "192.168.") {
+	if isLocalHost(host) {
 		s.reply(c, replyConnectionNotAllowed)
 		return nil, errors.New("socks5: localhost access not allowed")
 	}

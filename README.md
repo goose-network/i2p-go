@@ -3,7 +3,7 @@
 A clean-room I2P client/router written in pure Go. It connects to the
 public I2P network (netdb reseed, NTCP2 transports, ECIES-Ratchet
 garlic, streaming) and exposes a local SOCKS5 proxy for `.i2p`
-destinations.
+destinations — and, through a configured outproxy, for clearnet hosts.
 
 Reference implementation studied for protocol compatibility:
 [i2p.i2p](https://geti2p.net) (Java, 2.13.0). No Java runtime, no CGo —
@@ -29,6 +29,26 @@ Why the odd User-Agent: zzz.i2p runs I2PTunnelHTTPServer with
 passes the client's UA through untouched. The 403 body itself is still a
 complete HTTP response delivered over our data path.
 
+With an outproxy configured, clearnet HTTPS sites are reachable through
+I2P (verified 2026-10-16 against `exit.stormycloud.i2p`):
+
+```
+./i2p-go ... -outproxy exit.stormycloud.i2p -outproxy-type connect
+curl --socks5-hostname 127.0.0.1:9050 https://www.google.com/   # 200, 85 KB
+curl --socks5-hostname 127.0.0.1:9050 https://duckduckgo.com/   # 200, 236 KB
+```
+
+I2P has no Tor-style exit-node pool to choose from: an outproxy is a
+volunteer-run I2P destination that fetches the clearnet on your behalf,
+so `-outproxy` names one (an addressbook name such as
+`exit.stormycloud.i2p`, a `.b32.i2p` host, or a full base64
+destination, optionally with `:port`). The two `-outproxy-type`
+protocols are both spoken, matching the Java router: `connect` (HTTP
+CONNECT, the default — what the default outproxies speak) and `socks`
+(full SOCKS5 client). Most outproxies tunnel TLS only; stormycloud
+answers `CONNECT example.com:80` with `403 Forbidden`, which we surface
+to the SOCKS client as host-unreachable, just as the Java proxy does.
+
 What works:
 
 - Reseed (SU3 over HTTPS through the upstream proxy), netdb load/persist
@@ -42,6 +62,9 @@ What works:
 - I2P streaming protocol: SYN/SYN-ACK/data/CLOSE, gzip payloads,
   retransmit with RTO backoff
 - SOCKS5 CONNECT proxy with `.i2p` addressbook + b32 resolution
+- Outproxy forwarding of clearnet CONNECTs (HTTP CONNECT or SOCKS5
+  protocol, failure mapped to host-unreachable); localhost and LAN
+  targets are never relayed
 
 Known limitations:
 
@@ -71,6 +94,8 @@ Flags:
 | `-hosts` | *(none)* | addressbook file, `name=base64destination` lines |
 | `-seed` | *(built-in list)* | single reseed URL override |
 | `-netdb` | `netdb` | netdb directory (i2pd on-disk format); seeded once, then persisted |
+| `-outproxy` | *(none)* | outproxy for non-I2P hosts: addressbook name, `.b32.i2p`, or base64 destination, optional `:port` |
+| `-outproxy-type` | `connect` | protocol the outproxy speaks: `connect` (HTTP CONNECT) or `socks` (SOCKS5) |
 
 Then point any SOCKS5-aware client at `127.0.0.1:9050`:
 
@@ -86,7 +111,8 @@ request to a new destination includes the garlic handshake.
 ```
 cmd/i2p-go          router main: wiring, tunnels, client destination
 internal/
-  socks5            SOCKS5 CONNECT server, byte pump to streams
+  socks5            SOCKS5 CONNECT server, byte pump to streams,
+                    outproxy forwarding (outproxy.go)
   streaming         I2P streaming protocol (packets, connections, RTO)
   garlic            ECIES-Ratchet garlic routing (NS/NSR/ES, cloves)
   i2np              I2NP message codec (DatabaseStore, TunnelData, ...)

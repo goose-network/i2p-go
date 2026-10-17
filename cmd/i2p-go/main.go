@@ -55,17 +55,19 @@ func main() {
 		hostsFile = flag.String("hosts", "", "addressbook hosts.txt (name = base64 destination)")
 		seedURL   = flag.String("seed", "", "reseed URL (default: try the known list)")
 		netdbDir  = flag.String("netdb", "netdb", "netdb directory (i2pd on-disk format)")
+		outproxy  = flag.String("outproxy", "", "outproxy for non-I2P hosts: address (name, .b32.i2p, or base64) with optional :port")
+		outproxyT = flag.String("outproxy-type", "connect", "outproxy protocol: connect (HTTP CONNECT) or socks (SOCKS5)")
 	)
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	if err := run(*socksAddr, *upstream, *hostsFile, *seedURL, *netdbDir); err != nil {
+	if err := run(*socksAddr, *upstream, *hostsFile, *seedURL, *netdbDir, *outproxy, *outproxyT); err != nil {
 		log.Fatalf("i2p-go: %v", err)
 	}
 }
 
 // run starts the router and blocks serving SOCKS5 until failure.
-func run(socksAddr, upstream, hostsFile, seedURL, netdbDir string) error {
+func run(socksAddr, upstream, hostsFile, seedURL, netdbDir, outproxy, outproxyType string) error {
 	ctx := context.Background()
 
 	var pd *proxy.Dialer
@@ -165,6 +167,10 @@ func run(socksAddr, upstream, hostsFile, seedURL, netdbDir string) error {
 	}
 	log.Printf("SOCKS5 listening on %s", socksAddr)
 	srv := &socks5.Server{Resolver: r, Dialer: r.stream, Log: log.Default()}
+	if outproxy != "" {
+		srv.Outproxy = &socks5.OutproxyConfig{Addr: outproxy, Type: outproxyType}
+		log.Printf("non-I2P hosts relayed via outproxy %s (type %s)", outproxy, outproxyType)
+	}
 	return srv.Serve(l)
 }
 
